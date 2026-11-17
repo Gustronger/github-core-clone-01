@@ -20,7 +20,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Counter } from './src/determinism.ts';
 import { VIEWER } from './src/scenario.ts';
-import { Store } from './src/store.ts';
+import { Store, ApiError } from './src/store.ts';
 import { sendError, sendJson, parseJsonBody, type HandlerCtx } from './src/context.ts';
 import { handleGit } from './src/git-http.ts';
 import { handleRest } from './src/rest.ts';
@@ -192,11 +192,16 @@ export function createApp(): Server {
 
         sendError(res, 404, 'Not Found', requestId);
       } catch (err) {
-        // A handler must never take the process down: answer 500 JSON and
-        // keep serving (the repo-survives-errors check depends on it).
+        // A handler must never take the process down: answer the ApiError's
+        // own status (a 4xx the store raised), or 500 JSON, and keep
+        // serving (the repo-survives-errors check depends on it).
         if (!res.writableEnded) {
           try {
-            sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error', requestId);
+            if (err instanceof ApiError) {
+              sendError(res, err.status, err.message, requestId);
+            } else {
+              sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error', requestId);
+            }
           } catch {
             // The socket is already gone; nothing left to do.
           }
