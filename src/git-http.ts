@@ -74,6 +74,65 @@ interface CachedAd {
 
 const adCache = new WeakMap<Repo, Map<string, CachedAd>>();
 const packCache = new WeakMap<Repo, Map<string, Buffer>>();
+// Whole fetch and ls-refs responses, keyed exactly like the pack cache
+// (repo state version + object count + the request's wants/haves/depth/
+// shallow boundaries), so a repeated identical fetch — the 50 concurrent
+// clones of one tip — answers from one built Buffer instead of re-running
+// the negotiation, the object enumeration and the framing each time. The
+// key's state components are the same ones the pack cache relies on: refs
+// only change through a state-version bump, objects are only ever added
+// (a repo delete discards the Repo object, hence its WeakMap entry), so a
+// cached response can never be served for a different repo state.
+const fetchResponseCache = new WeakMap<Repo, Map<string, Buffer>>();
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+/** Cap for a per-repo response cache; cleared wholesale when full, like the pack cache. */
+const RESPONSE_CACHE_MAX = 64;
+
+function cachedResponse(
+  cache: WeakMap<Repo, Map<string, Buffer>>,
+  repo: Repo,
+  key: string,
+  build: () => Buffer,
+): Buffer {
+  let perRepo = cache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    cache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit) return hit;
+  const buffer = build();
+  if (perRepo.size >= RESPONSE_CACHE_MAX) perRepo.clear();
+  perRepo.set(key, buffer);
+  return buffer;
+}
+
+/**
+ * The cache key for one fetch: everything the negotiation, the pack and
+ * the framed response depend on. The pack cache and the whole-response
+ * cache share it (the response key adds a protocol prefix), so both stay
+ * in step about what "the same fetch" means.
+ */
+function fetchCacheKey(
+  repo: Repo,
+  depth: number | undefined,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallowIn: readonly string[],
+): string {
+  return [
+    repo.stateVersion,
+    repo.objects.size,
+    depth ?? '',
+    [...wants].sort().join(','),
+    [...haves].sort().join(','),
+    // The held set (and therefore the pack) also depends on the client's
+    // shallow boundaries: the same wants/depth/haves with a different
+    // boundary must not share a cached pack.
+    [...shallowIn].sort().join(','),
+  ].join('|');
+}
 
 function cachedAd(repo: Repo, key: string, build: () => Buffer): Buffer {
   let perRepo = adCache.get(repo);
@@ -205,29 +264,44 @@ function handleLsRefs(res: ServerResponse, ctx: HandlerCtx, repo: Repo, lines: s
     // agent=, object-format=, unborn and anything else: parsed, not needed
     // beyond the flags above (unborn HEAD is always reported when unborn).
   }
-  const headTarget = ctx.store.headTarget(repo);
-  const out: string[] = [];
-  const refs = ctx.store.listRefs(repo);
-  if (refs.length === 0) {
-    // Unborn repo: the one line the empty-clone check reads. With a
-    // ref-prefix filter HEAD is excluded, so nothing is reported.
-    if (prefixes.length === 0) {
-      out.push(`unborn HEAD${symrefs ? ` symref-target:${headTarget}` : ''}\n`);
-    }
-  } else if (prefixes.length === 0) {
-    const headOid = ctx.store.getRef(repo, headTarget) ?? ZERO_OID;
-    out.push(`${headOid} HEAD${symrefs ? ` symref-target:${headTarget}` : ''}\n`);
-    for (const ref of refs) {
-      out.push(lsRefLine(ctx.store, repo, ref, peel));
-    }
-  } else {
-    for (const ref of refs) {
-      if (prefixes.some((prefix) => ref.name.startsWith(prefix))) {
+  // The answer depends only on the repo state (refs, and tag objects when
+  // peeling) and the request's flags, so a repeated ls-refs — every clone
+  // of one tip sends the same one — reuses one built Buffer instead of
+  // re-listing the refs and re-framing the lines each time.
+  const key = [
+    'ls',
+    repo.stateVersion,
+    repo.objects.size,
+    peel ? 'peel' : '',
+    symrefs ? 'symrefs' : '',
+    prefixes.join(','),
+  ].join('|');
+  const body = cachedResponse(lsRefsCache, repo, key, () => {
+    const headTarget = ctx.store.headTarget(repo);
+    const out: string[] = [];
+    const refs = ctx.store.listRefs(repo);
+    if (refs.length === 0) {
+      // Unborn repo: the one line the empty-clone check reads. With a
+      // ref-prefix filter HEAD is excluded, so nothing is reported.
+      if (prefixes.length === 0) {
+        out.push(`unborn HEAD${symrefs ? ` symref-target:${headTarget}` : ''}\n`);
+      }
+    } else if (prefixes.length === 0) {
+      const headOid = ctx.store.getRef(repo, headTarget) ?? ZERO_OID;
+      out.push(`${headOid} HEAD${symrefs ? ` symref-target:${headTarget}` : ''}\n`);
+      for (const ref of refs) {
         out.push(lsRefLine(ctx.store, repo, ref, peel));
       }
+    } else {
+      for (const ref of refs) {
+        if (prefixes.some((prefix) => ref.name.startsWith(prefix))) {
+          out.push(lsRefLine(ctx.store, repo, ref, peel));
+        }
+      }
     }
-  }
-  sendRaw(res, 200, pktLines([...out, 'flush']), UPLOAD_RESULT_CT, ctx.requestId);
+    return pktLines([...out, 'flush']);
+  });
+  sendRaw(res, 200, body, UPLOAD_RESULT_CT, ctx.requestId);
 }
 
 function lsRefLine(store: Store, repo: Repo, ref: { name: string; oid: string }, peel: boolean): string {
@@ -448,17 +522,7 @@ function planFetch(
 
   let pack: Buffer | null = null;
   if (objects.size > 0 && !allHeld) {
-    const key = [
-      repo.stateVersion,
-      repo.objects.size,
-      depth ?? '',
-      [...wantSet].sort().join(','),
-      [...haves].sort().join(','),
-      // The held set (and therefore the pack) also depends on the client's
-      // shallow boundaries: the same wants/depth/haves with a different
-      // boundary must not share a cached pack.
-      [...shallowIn].sort().join(','),
-    ].join('|');
+    const key = fetchCacheKey(repo, depth, wants, haves, shallowIn);
     pack = cachedPack(repo, key, () =>
       writePack(sortPackObjects(store, repo, objects).map((object) => ({
         type: object.type,
@@ -492,29 +556,38 @@ function handleFetchV2(res: ServerResponse, ctx: HandlerCtx, repo: Repo, lines: 
   for (const oid of [...wants, ...haves]) {
     if (!isObjectId(oid)) throw new ApiError(400, `bad object id ${oid}`);
   }
-  const plan = planFetch(ctx.store, repo, wants, haves, shallowIn, depth);
-  const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
-  for (const line of plan.ackLines) parts.push(pktLine(`${line}\n`));
-  parts.push(PKT_DELIM);
-  if (depth !== undefined || shallowIn.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  // The whole answer — acknowledgments, shallow-info, wanted-refs and the
+  // framed pack — is a pure function of the repo state and this request's
+  // wants/haves/depth/shallow boundaries, so a repeated identical fetch
+  // reuses one built Buffer instead of re-running the negotiation, the
+  // object enumeration and the framing each time.
+  const key = `v2|${fetchCacheKey(repo, depth, wants, haves, shallowIn)}`;
+  const body = cachedResponse(fetchResponseCache, repo, key, () => {
+    const plan = planFetch(ctx.store, repo, wants, haves, shallowIn, depth);
+    const parts: Buffer[] = [];
+    parts.push(pktLine('acknowledgments\n'));
+    for (const line of plan.ackLines) parts.push(pktLine(`${line}\n`));
     parts.push(PKT_DELIM);
-  }
-  parts.push(pktLine('wanted-refs\n'));
-  // NOTE: each line is a bare `<oid> <ref>` — the client's parseV2Fetch
-  // takes the text before the first space as the oid, so no `wanted-ref`
-  // prefix here (the task text's `wanted-ref <sha> <ref>` would fail it).
-  for (const ref of plan.wantedRefs) parts.push(pktLine(`${ref.oid} ${ref.ref}\n`));
-  parts.push(PKT_DELIM);
-  if (plan.pack !== null) {
-    parts.push(pktLine('packfile\n'));
-    parts.push(sideband(plan.pack, 1));
-  }
-  parts.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(parts), UPLOAD_RESULT_CT, ctx.requestId);
+    if (depth !== undefined || shallowIn.length > 0) {
+      parts.push(pktLine('shallow-info\n'));
+      for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+      for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+      parts.push(PKT_DELIM);
+    }
+    parts.push(pktLine('wanted-refs\n'));
+    // NOTE: each line is a bare `<oid> <ref>` — the client's parseV2Fetch
+    // takes the text before the first space as the oid, so no `wanted-ref`
+    // prefix here (the task text's `wanted-ref <sha> <ref>` would fail it).
+    for (const ref of plan.wantedRefs) parts.push(pktLine(`${ref.oid} ${ref.ref}\n`));
+    parts.push(PKT_DELIM);
+    if (plan.pack !== null) {
+      parts.push(pktLine('packfile\n'));
+      parts.push(sideband(plan.pack, 1));
+    }
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
+  sendRaw(res, 200, body, UPLOAD_RESULT_CT, ctx.requestId);
 }
 
 function handleFetchV0(res: ServerResponse, ctx: HandlerCtx, repo: Repo): void {
@@ -541,14 +614,20 @@ function handleFetchV0(res: ServerResponse, ctx: HandlerCtx, repo: Repo): void {
   for (const oid of [...wants, ...haves]) {
     if (!isObjectId(oid)) throw new ApiError(400, `bad object id ${oid}`);
   }
-  const plan = planFetch(ctx.store, repo, wants, haves, shallowIn, depth);
-  const parts: Buffer[] = [];
-  for (const line of plan.ackLines) parts.push(pktLine(`${line}\n`));
-  for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  if (plan.pack !== null) parts.push(sideband(plan.pack, 1));
-  parts.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(parts), UPLOAD_RESULT_CT, ctx.requestId);
+  // Same whole-response caching as the v2 fetch (the framing differs, so
+  // the key carries the protocol version).
+  const key = `v0|${fetchCacheKey(repo, depth, wants, haves, shallowIn)}`;
+  const body = cachedResponse(fetchResponseCache, repo, key, () => {
+    const plan = planFetch(ctx.store, repo, wants, haves, shallowIn, depth);
+    const parts: Buffer[] = [];
+    for (const line of plan.ackLines) parts.push(pktLine(`${line}\n`));
+    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    if (plan.pack !== null) parts.push(sideband(plan.pack, 1));
+    parts.push(PKT_FLUSH);
+    return Buffer.concat(parts);
+  });
+  sendRaw(res, 200, body, UPLOAD_RESULT_CT, ctx.requestId);
 }
 
 function handleUploadPack(

@@ -27,15 +27,16 @@ function asBuffer(value: string | Uint8Array): Buffer {
   return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
-/** Encode one data packet: 4 hex length bytes then the payload. */
+/** Encode one data packet: 4 hex length bytes then the payload. One allocation: the header is written into the same buffer the payload is copied into, instead of concatenating a header buffer and a payload buffer. */
 export function pktLine(payload: string | Uint8Array): Buffer {
   const data = asBuffer(payload);
   if (data.length > PKT_LINE_MAX_PAYLOAD) {
     throw new Error(`pkt-line payload is ${data.length} bytes, over the ${PKT_LINE_MAX_PAYLOAD}-byte maximum`);
   }
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  const out = Buffer.allocUnsafe(data.length + 4);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
 /** Encode a mixed sequence; `'flush'` / `'delim'` / `'response-end'` are the control packets. */
@@ -57,7 +58,53 @@ export type PktPacket =
   | { readonly kind: 'delim' }
   | { readonly kind: 'response-end' };
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+/**
+ * The numeric value of one ASCII hex digit byte, or -1 when the byte is not
+ * a hex digit. Lets the decoders below read a 4-byte length header straight
+ * out of the buffer instead of slicing a string and running a regex and a
+ * parseInt on every packet.
+ */
+function hexValue(byte: number): number {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+  if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+  if (byte >= 0x41 && byte <= 0x46) return byte - 0x41 + 10;
+  return -1;
+}
+
+/**
+ * Read one pkt-line length header at `offset` and return the announced
+ * length. Throws on a truncated header or on non-hex bytes, with the same
+ * messages the old string-based read produced.
+ */
+function readPktLength(buffer: Buffer, offset: number): number {
+  if (offset + 4 > buffer.length) {
+    throw new Error(`truncated pkt-line: ${buffer.length - offset} trailing byte(s)`);
+  }
+  const v0 = hexValue(buffer[offset]);
+  const v1 = hexValue(buffer[offset + 1]);
+  const v2 = hexValue(buffer[offset + 2]);
+  const v3 = hexValue(buffer[offset + 3]);
+  if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
+    // Error path only: build the header string for the message.
+    const header = buffer.subarray(offset, offset + 4).toString('ascii');
+    throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
+  }
+  return (v0 << 12) | (v1 << 8) | (v2 << 4) | v3;
+}
+
+/**
+ * Validate an announced length the way both decoders did: 3 is invalid,
+ * anything past the max is invalid, and a packet that runs past the end of
+ * the buffer is truncated. Returns the length when it is usable.
+ */
+function checkPktLength(buffer: Buffer, offset: number, length: number): number {
+  if (length === 3) throw new Error('invalid pkt-line length 0003');
+  if (length > PKT_LINE_MAX) throw new Error(`pkt-line length ${length} exceeds ${PKT_LINE_MAX}`);
+  if (offset + length > buffer.length) {
+    throw new Error(`truncated pkt-line: ${length} announced, ${buffer.length - offset} available`);
+  }
+  return length;
+}
 
 /**
  * Decode a complete buffer into packets. Throws on a malformed header or a
@@ -69,12 +116,7 @@ export function decodePktLines(bytes: Uint8Array): PktPacket[] {
   const packets: PktPacket[] = [];
   let offset = 0;
   while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) {
-      throw new Error(`truncated pkt-line: ${buffer.length - offset} trailing byte(s)`);
-    }
-    const header = buffer.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
-    const length = Number.parseInt(header, 16);
+    const length = readPktLength(buffer, offset);
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -90,11 +132,7 @@ export function decodePktLines(bytes: Uint8Array): PktPacket[] {
       offset += 4;
       continue;
     }
-    if (length === 3) throw new Error('invalid pkt-line length 0003');
-    if (length > PKT_LINE_MAX) throw new Error(`pkt-line length ${length} exceeds ${PKT_LINE_MAX}`);
-    if (offset + length > buffer.length) {
-      throw new Error(`truncated pkt-line: ${length} announced, ${buffer.length - offset} available`);
-    }
+    checkPktLength(buffer, offset, length);
     packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
     offset += length;
   }
@@ -112,12 +150,7 @@ export function splitAtFlush(bytes: Uint8Array): { packets: PktPacket[]; restOff
   const packets: PktPacket[] = [];
   let offset = 0;
   while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) {
-      throw new Error(`truncated pkt-line: ${buffer.length - offset} trailing byte(s)`);
-    }
-    const header = buffer.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
-    const length = Number.parseInt(header, 16);
+    const length = readPktLength(buffer, offset);
     if (length === 0) {
       packets.push({ kind: 'flush' });
       return { packets, restOffset: offset + 4 };
@@ -132,11 +165,7 @@ export function splitAtFlush(bytes: Uint8Array): { packets: PktPacket[]; restOff
       offset += 4;
       continue;
     }
-    if (length === 3) throw new Error('invalid pkt-line length 0003');
-    if (length > PKT_LINE_MAX) throw new Error(`pkt-line length ${length} exceeds ${PKT_LINE_MAX}`);
-    if (offset + length > buffer.length) {
-      throw new Error(`truncated pkt-line: ${length} announced, ${buffer.length - offset} available`);
-    }
+    checkPktLength(buffer, offset, length);
     packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
     offset += length;
   }
@@ -155,16 +184,23 @@ export function packetLines(packets: readonly PktPacket[]): string[] {
 /**
  * Split `data` into sideband packets of the given band (1 = pack data,
  * 2 = progress, 3 = error), each a pkt-line holding one band byte plus a
- * chunk of the data. The whole result is one Buffer, ready to send.
+ * chunk of the data. The whole result is one Buffer, ready to send. The
+ * framing is written straight into one pre-sized buffer instead of building
+ * a framed buffer per chunk and concatenating them.
  */
 export function sideband(data: Uint8Array, band: 1 | 2 | 3): Buffer {
   const body = asBuffer(data);
-  const parts: Buffer[] = [];
+  if (body.length === 0) return pktLine(Buffer.from([band]));
+  const chunks = Math.ceil(body.length / SIDEBAND_MAX_PAYLOAD);
+  // Per chunk: 4 header bytes + 1 band byte + the chunk's bytes.
+  const out = Buffer.allocUnsafe(body.length + chunks * 5);
+  let pos = 0;
   for (let offset = 0; offset < body.length; offset += SIDEBAND_MAX_PAYLOAD) {
-    const chunk = body.subarray(offset, Math.min(body.length, offset + SIDEBAND_MAX_PAYLOAD));
-    const framed = Buffer.concat([Buffer.from([band]), chunk]);
-    parts.push(pktLine(framed));
+    const chunkLen = Math.min(SIDEBAND_MAX_PAYLOAD, body.length - offset);
+    out.write((chunkLen + 5).toString(16).padStart(4, '0'), pos, 4, 'ascii');
+    out[pos + 4] = band;
+    body.copy(out, pos + 5, offset, offset + chunkLen);
+    pos += 5 + chunkLen;
   }
-  if (body.length === 0) parts.push(pktLine(Buffer.from([band])));
-  return Buffer.concat(parts);
+  return out;
 }
