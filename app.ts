@@ -1,49 +1,207 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// The forge's HTTP server: routing, auth, and the JSON discipline.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// Cross-cutting rules (the protocol group owns them):
+// - Every reply carries a non-empty `X-GitHub-Request-Id` (`req-<n>`).
+// - Every REST/GraphQL/MCP reply is `application/json`, never HTML,
+//   including 401s, 404s and 400s; error bodies are `{message: string}`.
+// - Unknown routes answer 404 JSON; a malformed JSON body answers 400.
+// - Auth is `Authorization: Bearer <token>` or `token <token>`, compared
+//   by exact string equality with MAKEFUN_SHOP_TOKEN; a request without
+//   it is 401 (except /healthz and the public API root/meta, as the
+//   starter ships them).
+// - A repository belongs to the viewer login only; any other owner is
+//   foreign and answers 404, never 403 (enforced in the surfaces).
+//
+// Routing: /healthz → boot probe; /api/v3[/] and /api/v3/meta → public;
+// /api/v3/* → REST; /api/graphql → GraphQL; /mcp → MCP;
+// /{owner}/{repo}.git/* → git smart HTTP. Every handler is wrapped so a
+// throw becomes a 500 JSON and the process keeps serving.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Counter } from './src/determinism.ts';
+import { VIEWER } from './src/scenario.ts';
+import { Store } from './src/store.ts';
+import { sendError, sendJson, parseJsonBody, type HandlerCtx } from './src/context.ts';
+import { handleGit } from './src/git-http.ts';
+import { handleRest } from './src/rest.ts';
+import { handleGraphql } from './src/graphql.ts';
+import { handleMcp } from './src/mcp.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+/** The largest request body accepted (packs are a few hundred KiB at most). */
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+/** The token the entry's endpoints take, from the trial environment. */
+const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+/** True when the request carries the trial token (Bearer or token scheme). */
+function isAuthed(req: IncomingMessage): boolean {
+  if (SHOP_TOKEN === '') return false;
+  const header = req.headers.authorization ?? '';
+  const match = /^(?:Bearer|token)\s+(.+)$/i.exec(header.trim());
+  return match !== null && match[1] === SHOP_TOKEN;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/** The path of a request URL, or '/' when it does not parse. */
+function pathOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** Read the request body fully, up to MAX_BODY_BYTES (an error past it). */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let failed = false;
+    req.on('data', (chunk: Buffer) => {
+      if (failed) return;
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        failed = true;
+        reject(new Error('request body is too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks, total));
+    });
+    req.on('error', (err) => {
+      if (!failed) {
+        failed = true;
+        reject(err);
+      }
+    });
+  });
+}
+
+/** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
+  const store = new Store();
+  const requestIds = new Counter();
+
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+    void (async () => {
+      const requestId = `req-${requestIds.next()}`;
+      const { path, query } = pathOf(req);
+      const method = req.method ?? 'GET';
+      const segments = path.split('/').filter((segment) => segment !== '');
+      const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
+      try {
+        // The env's boot check calls this twice: 200 {"ok":true}, no auth.
+        if (method === 'GET' && path === '/healthz') {
+          sendJson(res, 200, { ok: true }, requestId);
+          return;
+        }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
+        const isGitRoute = segments.length >= 2 && segments[1].endsWith('.git');
+        const body = needsBody ? await readBody(req) : Buffer.alloc(0);
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+        // The git surfaces take a binary body; the rest take JSON. A body
+        // that is present but does not parse as JSON is a 400 on the JSON
+        // routes (the protocol group's malformed-body check); on any other
+        // route the body is the surface's to judge.
+        let json: unknown;
+        let bodyJsonError = false;
+        if (!isGitRoute && body.length > 0) {
+          const parsed = parseJsonBody(body);
+          json = parsed.json;
+          bodyJsonError = parsed.error;
+        }
+
+        const ctx: HandlerCtx = {
+          store,
+          method,
+          path,
+          query,
+          segments,
+          body,
+          json,
+          bodyJsonError,
+          requestId,
+        };
+
+        // The public API root and meta, as the starter ships them.
+        if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+          sendJson(
+            res,
+            200,
+            { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' },
+            requestId,
+            { 'x-oauth-scopes': 'repo, read:org' },
+          );
+          return;
+        }
+        if (method === 'GET' && path === '/api/v3/meta') {
+          sendJson(res, 200, { installed_version: '1.0.0' }, requestId);
+          return;
+        }
+
+        // Everything else needs the trial token.
+        if (!isAuthed(req)) {
+          sendError(res, 401, 'Requires authentication', requestId);
+          return;
+        }
+
+        // The viewer endpoint: the login the token names.
+        if (method === 'GET' && path === '/api/v3/user') {
+          sendJson(
+            res,
+            200,
+            { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email },
+            requestId,
+          );
+          return;
+        }
+
+        // A malformed JSON body is a 400 on the JSON routes only; an
+        // unknown route with a bad body is still a 404 (see below).
+        const isJsonRoute =
+          path === '/api/graphql' ||
+          path.startsWith('/api/graphql/') ||
+          path === '/mcp' ||
+          path.startsWith('/mcp/') ||
+          path === '/api/v3' ||
+          path.startsWith('/api/v3/');
+        if (isJsonRoute && bodyJsonError) {
+          sendError(res, 400, 'Problems parsing JSON', requestId);
+          return;
+        }
+
+        if (path === '/api/graphql' || path.startsWith('/api/graphql/')) {
+          await handleGraphql(req, res, ctx);
+          return;
+        }
+        if (path === '/mcp' || path.startsWith('/mcp/')) {
+          await handleMcp(req, res, ctx);
+          return;
+        }
+        if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+          await handleRest(req, res, ctx);
+          return;
+        }
+        if (isGitRoute) {
+          await handleGit(req, res, ctx);
+          return;
+        }
+
+        sendError(res, 404, 'Not Found', requestId);
+      } catch (err) {
+        // A handler must never take the process down: answer 500 JSON and
+        // keep serving (the repo-survives-errors check depends on it).
+        if (!res.writableEnded) {
+          try {
+            sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error', requestId);
+          } catch {
+            // The socket is already gone; nothing left to do.
+          }
+        }
+      }
+    })();
   });
 }
