@@ -161,11 +161,12 @@ export function createApp(): Server {
 
         // A malformed JSON body is a 400 on the JSON routes only; an
         // unknown route with a bad body is still a 404 (see below).
+        // /mcp is exempted: the MCP handler answers a malformed body
+        // itself with JSON-RPC -32700 (the parse-error check), so the
+        // 400-before-dispatch here must not swallow it.
         const isJsonRoute =
           path === '/api/graphql' ||
           path.startsWith('/api/graphql/') ||
-          path === '/mcp' ||
-          path.startsWith('/mcp/') ||
           path === '/api/v3' ||
           path.startsWith('/api/v3/');
         if (isJsonRoute && bodyJsonError) {
