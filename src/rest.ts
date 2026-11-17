@@ -42,6 +42,9 @@ function bodyBoolean(body: Record<string, unknown>, field: string): boolean | un
 /** The path segments, percent-decoded (the client encodes each segment). */
 function decodedSegments(ctx: HandlerCtx): string[] {
   return ctx.segments.map((segment) => {
+    // Most segments carry no escapes; decodeURIComponent is the identity
+    // on them, so only call it when a '%' is present.
+    if (segment.indexOf('%') === -1) return segment;
     try {
       return decodeURIComponent(segment);
     } catch {

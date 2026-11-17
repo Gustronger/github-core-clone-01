@@ -33,49 +33,101 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** The token the entry's endpoints take, from the trial environment. */
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-/** True when the request carries the trial token (Bearer or token scheme). */
+/**
+ * True when the request carries the trial token (Bearer or token scheme).
+ * The `Authorization: Bearer <token>` / `token <token>` check, written with
+ * string operations instead of a regex: the scheme is the text before the
+ * first space or tab (matched case-insensitively), the token is the rest
+ * after any further spaces or tabs, compared by exact string equality.
+ * (Header values reach us with leading/trailing whitespace already
+ * trimmed by the HTTP parser; the trim keeps the old behaviour for any
+ * exotic value that still carries some.)
+ */
 function isAuthed(req: IncomingMessage): boolean {
   if (SHOP_TOKEN === '') return false;
-  const header = req.headers.authorization ?? '';
-  const match = /^(?:Bearer|token)\s+(.+)$/i.exec(header.trim());
-  return match !== null && match[1] === SHOP_TOKEN;
+  const header = (req.headers.authorization ?? '').trim();
+  let split = header.indexOf(' ');
+  const tab = header.indexOf('\t');
+  if (tab !== -1 && (split === -1 || tab < split)) split = tab;
+  if (split <= 0) return false;
+  const scheme = header.slice(0, split).toLowerCase();
+  if (scheme !== 'bearer' && scheme !== 'token') return false;
+  let start = split + 1;
+  while (start < header.length && (header[start] === ' ' || header[start] === '\t')) start += 1;
+  return start < header.length && header.slice(start) === SHOP_TOKEN;
 }
 
-/** The path of a request URL, or '/' when it does not parse. */
+/**
+ * The path of a request URL, or '/' when it does not parse.
+ *
+ * Fast path: an origin-form target (what every client sends) with no dot
+ * segments, backslashes, encoded dots or control characters splits by hand
+ * into the same pathname `new URL` would return, without constructing a
+ * URL. Anything unusual falls back to `new URL`, so absolute-form targets,
+ * dot-segment resolution, backslash handling and malformed URLs behave
+ * exactly as before.
+ */
 function pathOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  if (raw.startsWith('/')) {
+    const hash = raw.indexOf('#');
+    const clean = hash === -1 ? raw : raw.slice(0, hash);
+    if (
+      clean.indexOf('\t') === -1 &&
+      clean.indexOf('\n') === -1 &&
+      clean.indexOf('\r') === -1 &&
+      !clean.startsWith('//') &&
+      !clean.includes('/./') &&
+      !clean.includes('/../') &&
+      !clean.endsWith('/.') &&
+      !clean.endsWith('/..') &&
+      !clean.includes('\\') &&
+      clean.indexOf('%2E') === -1 &&
+      clean.indexOf('%2e') === -1
+    ) {
+      const q = clean.indexOf('?');
+      if (q === -1) return { path: clean, query: new URLSearchParams() };
+      return { path: clean.slice(0, q), query: new URLSearchParams(clean.slice(q + 1)) };
+    }
+  }
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
     return { path: url.pathname, query: url.searchParams };
   } catch {
     return { path: '/', query: new URLSearchParams() };
   }
 }
 
-/** Read the request body fully, up to MAX_BODY_BYTES (an error past it). */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let failed = false;
-    req.on('data', (chunk: Buffer) => {
-      if (failed) return;
-      total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
-        failed = true;
-        reject(new Error('request body is too large'));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (!failed) resolve(Buffer.concat(chunks, total));
-    });
-    req.on('error', (err) => {
-      if (!failed) {
-        failed = true;
-        reject(err);
-      }
-    });
+/**
+ * Read the request body fully, up to MAX_BODY_BYTES, then call `done` with
+ * it — or with the error, past the limit or on a stream error. A callback,
+ * not a promise: the request path stays off the promise machinery (one
+ * fewer microtask turn per request). A single chunk is handed over as-is
+ * instead of copied through Buffer.concat.
+ */
+function readBody(req: IncomingMessage, done: (body: Buffer, err?: Error) => void): void {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let settled = false;
+  req.on('data', (chunk: Buffer) => {
+    if (settled) return;
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) {
+      settled = true;
+      done(Buffer.alloc(0), new Error('request body is too large'));
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => {
+    if (settled) return;
+    settled = true;
+    done(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, total));
+  });
+  req.on('error', (err) => {
+    if (settled) return;
+    settled = true;
+    done(Buffer.alloc(0), err);
   });
 }
 
@@ -85,22 +137,44 @@ export function createApp(): Server {
   const requestIds = new Counter();
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const requestId = `req-${requestIds.next()}`;
-      const { path, query } = pathOf(req);
-      const method = req.method ?? 'GET';
-      const segments = path.split('/').filter((segment) => segment !== '');
-      const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+    const requestId = `req-${requestIds.next()}`;
+    const { path, query } = pathOf(req);
+    const method = req.method ?? 'GET';
+    const segments = path.split('/').filter((segment) => segment !== '');
+    const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 
-      try {
-        // The env's boot check calls this twice: 200 {"ok":true}, no auth.
-        if (method === 'GET' && path === '/healthz') {
-          sendJson(res, 200, { ok: true }, requestId);
-          return;
+    // The env's boot check calls this twice: 200 {"ok":true}, no auth.
+    if (method === 'GET' && path === '/healthz') {
+      sendJson(res, 200, { ok: true }, requestId);
+      return;
+    }
+
+    // The dispatch runs synchronously once the body (if any) is in: the
+    // request path stays off the promise machinery — no async wrapper, no
+    // await — and every surface handler is synchronous, so one try/catch
+    // still covers the whole dispatch. A body that could not be read is a
+    // 500, as the old await's catch was.
+    if (!needsBody) {
+      dispatch(Buffer.alloc(0));
+      return;
+    }
+    readBody(req, (body, err) => {
+      if (err) {
+        if (!res.writableEnded) {
+          try {
+            sendError(res, 500, err.message, requestId);
+          } catch {
+            // The socket is already gone; nothing left to do.
+          }
         }
+        return;
+      }
+      dispatch(body);
+    });
 
+    function dispatch(body: Buffer): void {
+      try {
         const isGitRoute = segments.length >= 2 && segments[1].endsWith('.git');
-        const body = needsBody ? await readBody(req) : Buffer.alloc(0);
 
         // The git surfaces take a binary body; the rest take JSON. A body
         // that is present but does not parse as JSON is a 400 on the JSON
@@ -175,19 +249,19 @@ export function createApp(): Server {
         }
 
         if (path === '/api/graphql' || path.startsWith('/api/graphql/')) {
-          await handleGraphql(req, res, ctx);
+          handleGraphql(req, res, ctx);
           return;
         }
         if (path === '/mcp' || path.startsWith('/mcp/')) {
-          await handleMcp(req, res, ctx);
+          handleMcp(req, res, ctx);
           return;
         }
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          await handleRest(req, res, ctx);
+          handleRest(req, res, ctx);
           return;
         }
         if (isGitRoute) {
-          await handleGit(req, res, ctx);
+          handleGit(req, res, ctx);
           return;
         }
 
@@ -208,6 +282,6 @@ export function createApp(): Server {
           }
         }
       }
-    })();
+    }
   });
 }

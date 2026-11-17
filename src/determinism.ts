@@ -41,7 +41,44 @@ export class LogicalClock {
 
 /** Format a Unix timestamp as an ISO-8601 string (no clock advance). */
 export function formatIso(epochSec: number): string {
-  return new Date(epochSec * 1000).toISOString();
+  // Integer civil-from-days (Howard Hinnant's algorithm): the same string
+  // `new Date(epochSec * 1000).toISOString()` produces, without building a
+  // Date. Years outside 0000–9999 take the slow path (toISOString's
+  // six-digit signed form), so every input stays exact.
+  const days = Math.floor(epochSec / 86_400);
+  const secsOfDay = epochSec - days * 86_400;
+  const z = days + 719_468;
+  const era = Math.floor(z / 146_097);
+  const doe = z - era * 146_097;
+  const yoe = Math.floor(
+    (doe - Math.floor(doe / 1_460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365,
+  );
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  const year = m <= 2 ? y + 1 : y;
+  if (year < 0 || year > 9_999) return new Date(epochSec * 1_000).toISOString();
+  const hh = Math.floor(secsOfDay / 3_600);
+  const mm = Math.floor((secsOfDay % 3_600) / 60);
+  const ss = secsOfDay % 60;
+  return (
+    `${pad4(year)}-${pad2(m)}-${pad2(d)}T${pad2(hh)}:${pad2(mm)}:${pad2(ss)}.000Z`
+  );
+}
+
+/** Zero-pad a number to two digits. */
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+/** Zero-pad a number to four digits. */
+function pad4(n: number): string {
+  if (n < 10) return `000${n}`;
+  if (n < 100) return `00${n}`;
+  if (n < 1_000) return `0${n}`;
+  return `${n}`;
 }
 
 /**
